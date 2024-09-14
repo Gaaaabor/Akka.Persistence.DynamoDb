@@ -18,8 +18,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Akka.Persistence.Query" Version="1.5.2" />
-    <PackageReference Include="AWSSDK.DynamoDBv2" Version="3.7.5.14" />
+    <PackageReference Include="Akka.Persistence.Query" Version="1.5.28" />
+    <PackageReference Include="AWSSDK.DynamoDBv2" Version="3.7.400.20" />
   </ItemGroup>
 
   <ItemGroup>
