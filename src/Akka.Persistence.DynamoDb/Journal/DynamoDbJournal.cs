@@ -11,21 +11,13 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Akka.Persistence.DynamoDb.Journal
 {
     public class DynamoDbJournal : AsyncWriteJournal, IWithUnboundedStash
     {
-        public static class Events
-        {
-            public sealed class Initialized
-            {
-                public static readonly Initialized Instance = new();
-                private Initialized() { }
-            }
-        }
-
         private readonly ActorSystem _actorSystem;
         private readonly AmazonDynamoDBClient _client;
         private readonly DynamoDbJournalSettings _settings;
@@ -40,9 +32,9 @@ namespace Akka.Persistence.DynamoDb.Journal
         {
             _actorSystem = Context.System;
 
-            _settings = config is null ?
-                DynamoDbPersistence.Get(Context.System).JournalSettings :
-                DynamoDbJournalSettings.Create(config);
+            _settings = config is null
+                ? DynamoDbPersistence.Get(Context.System).JournalSettings
+                : DynamoDbJournalSettings.Create(config);
 
             _client = DynamoDbSetup.InitClient(_settings);
         }
@@ -55,8 +47,8 @@ namespace Akka.Persistence.DynamoDb.Journal
 
             if (!_settings.AutoInitialize)
             {
-                _table = Table.LoadTable(_client, _settings.TableName);
-
+                var builder = new TableBuilder(_client, new TableConfig(_settings.TableName));
+                _table = builder.Build();
                 return;
             }
 
@@ -72,7 +64,8 @@ namespace Akka.Persistence.DynamoDb.Journal
             long max,
             Action<IPersistentRepresentation> recoveryCallback)
         {
-            var filter = new QueryFilter(EventDocument.Keys.SequenceNumber, QueryOperator.Between, fromSequenceNr, toSequenceNr);
+            var filter = new QueryFilter(EventDocument.Keys.SequenceNumber, QueryOperator.Between, fromSequenceNr,
+                toSequenceNr);
 
             var search = _table!.Query(EventDocument.GetEventGroupKey(persistenceId), filter);
 
@@ -102,24 +95,29 @@ namespace Akka.Persistence.DynamoDb.Journal
                 NotifyNewPersistenceIdAdded(persistenceId);
         }
 
-        public override async Task<long> ReadHighestSequenceNrAsync(string persistenceId, long fromSequenceNr)
+        /// <inheritdoc />
+        public override async Task<long> ReadHighestSequenceNrAsync(string persistenceId, long fromSequenceNr, CancellationToken cancellationToken)
         {
-            var item = await _table!.GetItemAsync(EventDocument.GetHighestSequenceNumberGroupKey(persistenceId), 0L);
+            var item = await _table!.GetItemAsync(EventDocument.GetHighestSequenceNumberGroupKey(persistenceId), 0L, cancellationToken);
 
-            var eventDocument = item != null ? new EventDocument(item) : null;
+            var eventDocument = item != null
+                ? new EventDocument(item)
+                : null;
 
             var sequenceNumber = eventDocument?.HighestSequenceNumber ?? 0;
 
             if (sequenceNumber <= 0)
+            {
                 NotifyNewPersistenceIdAdded(persistenceId);
+            }
 
             return sequenceNumber;
         }
 
-        protected override async Task<IImmutableList<Exception?>?> WriteMessagesAsync(IEnumerable<AtomicWrite> messages)
+        /// <inheritdoc />
+        protected override async Task<IImmutableList<Exception>> WriteMessagesAsync(IEnumerable<AtomicWrite> messages, CancellationToken cancellationToken)
         {
             var results = new List<Exception?>();
-
             var allTags = new List<string>();
 
             foreach (var atomicWrite in messages)
@@ -127,20 +125,23 @@ namespace Akka.Persistence.DynamoDb.Journal
                 try
                 {
                     var batch = _table!.CreateBatchWrite();
-
                     var items = atomicWrite.Payload.AsInstanceOf<IImmutableList<IPersistentRepresentation>>();
 
                     foreach (var persistentRepresentation in items)
                     {
                         if (persistentRepresentation.SequenceNr == 0)
+                        {
                             NotifyNewPersistenceIdAdded(persistentRepresentation.PersistenceId);
+                        }
 
                         var (documents, tags) = EventDocument.ToDocument(persistentRepresentation, _actorSystem);
 
                         allTags.AddRange(tags);
 
                         foreach (var document in documents)
+                        {
                             batch.AddDocumentToPut(document);
+                        }
                     }
 
                     var highestSequenceNumbers = items
@@ -155,10 +156,10 @@ namespace Akka.Persistence.DynamoDb.Journal
 
                     foreach (var highestSequenceNumber in highestSequenceNumbers)
                     {
-                        await _table.UpdateItemAsync(highestSequenceNumber);
+                        await _table.UpdateItemAsync(highestSequenceNumber, cancellationToken);
                     }
 
-                    await batch.ExecuteAsync();
+                    await batch.ExecuteAsync(cancellationToken);
 
                     results.Add(null);
                 }
@@ -176,25 +177,32 @@ namespace Akka.Persistence.DynamoDb.Journal
                     NotifyTagChange(tag);
             }
 
-            return results.Any(x => x != null) ? results.ToImmutableList() : null;
+            return results.Any(x => x != null)
+                ? results.ToImmutableList()
+                : null;
         }
 
-        protected override async Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr)
+        /// <inheritdoc />
+        protected override async Task DeleteMessagesToAsync(string persistenceId, long toSequenceNr,
+            CancellationToken cancellationToken)
         {
-            var filter = new QueryFilter(EventDocument.Keys.SequenceNumber, QueryOperator.LessThanOrEqual, toSequenceNr);
+            var filter = new QueryFilter(EventDocument.Keys.SequenceNumber, QueryOperator.LessThanOrEqual,
+                toSequenceNr);
 
             var search = _table!.Query(EventDocument.GetEventGroupKey(persistenceId), filter);
 
             while (!search.IsDone)
             {
-                var items = await search.GetNextSetAsync();
+                var items = await search.GetNextSetAsync(cancellationToken);
 
                 var batch = _table.CreateBatchWrite();
 
                 foreach (var item in items)
+                {
                     batch.AddItemToDelete(item);
+                }
 
-                await batch.ExecuteAsync();
+                await batch.ExecuteAsync(cancellationToken);
             }
         }
 
@@ -219,18 +227,18 @@ namespace Akka.Persistence.DynamoDb.Journal
                         new(EventDocument.Keys.SequenceNumber, KeyType.RANGE)
                     }.ToImmutableList(),
                     ImmutableList.Create(new GlobalSecondaryIndex
-                    {
-                        IndexName = "ByDocumentType",
-                        KeySchema = new List<KeySchemaElement>
+                        {
+                            IndexName = "ByDocumentType",
+                            KeySchema = new List<KeySchemaElement>
                             {
                                 new(EventDocument.Keys.DocumentType, KeyType.HASH),
                                 new(EventDocument.Keys.PersistenceId, KeyType.RANGE)
                             },
-                        Projection = new Projection
-                        {
-                            ProjectionType = ProjectionType.KEYS_ONLY
-                        }
-                    },
+                            Projection = new Projection
+                            {
+                                ProjectionType = ProjectionType.KEYS_ONLY
+                            }
+                        },
                         new GlobalSecondaryIndex
                         {
                             IndexName = "ByTag",
@@ -250,7 +258,8 @@ namespace Akka.Persistence.DynamoDb.Journal
                             }
                         }));
 
-                _table = Table.LoadTable(_client, _settings.TableName);
+                var builder = new TableBuilder(_client, new TableConfig(_settings.TableName));
+                _table = builder.Build();
 
                 return Events.Initialized.Instance;
             }
@@ -294,7 +303,9 @@ namespace Akka.Persistence.DynamoDb.Journal
             {
                 case ReplayTaggedMessages replay:
                     ReplayTaggedMessagesAsync(replay)
-                        .PipeTo(replay.ReplyTo, success: h => replay.IsCatchup ? new TagCatchupFinished(h) : new RecoverySuccess(h), failure: e => new ReplayMessagesFailure(e));
+                        .PipeTo(replay.ReplyTo,
+                            success: h => replay.IsCatchup ? new TagCatchupFinished(h) : new RecoverySuccess(h),
+                            failure: e => new ReplayMessagesFailure(e));
                     break;
                 case SubscribeAllPersistenceIds:
                     AddAllPersistenceIdSubscriber(Sender).PipeTo(Sender);
@@ -321,7 +332,8 @@ namespace Akka.Persistence.DynamoDb.Journal
 
             var filter = new QueryFilter();
             filter.AddCondition(EventDocument.Keys.Tag, QueryOperator.Equal, replay.Tag);
-            filter.AddCondition(EventDocument.Keys.Timestamp, QueryOperator.Between, replay.FromOffset + 1, replay.ToOffset);
+            filter.AddCondition(EventDocument.Keys.Timestamp, QueryOperator.Between, replay.FromOffset + 1,
+                replay.ToOffset);
 
             var search = _table!.Query(new QueryOperationConfig
             {
@@ -399,7 +411,8 @@ namespace Akka.Persistence.DynamoDb.Journal
                 _allPersistenceIdSubscribers.Add(subscriber);
             }
 
-            var filter = new QueryFilter(EventDocument.Keys.DocumentType, QueryOperator.Equal, EventDocument.DocumentTypes.HighestSequenceNumber);
+            var filter = new QueryFilter(EventDocument.Keys.DocumentType, QueryOperator.Equal,
+                EventDocument.DocumentTypes.HighestSequenceNumber);
 
             var search = _table!.Query(new QueryOperationConfig
             {
