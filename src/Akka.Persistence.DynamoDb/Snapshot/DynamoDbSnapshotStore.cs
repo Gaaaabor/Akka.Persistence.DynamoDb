@@ -1,29 +1,22 @@
-using Akka.Actor;
-using Akka.Configuration;
-using Akka.Event;
-using Akka.Persistence.Snapshot;
-using Amazon.DynamoDBv2;
-using Amazon.DynamoDBv2.DocumentModel;
-using Amazon.DynamoDBv2.Model;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
+using Akka.Actor;
+using Akka.Configuration;
+using Akka.Event;
+using Akka.Persistence.DynamoDb.Extensions;
+using Akka.Persistence.Snapshot;
+using Amazon.DynamoDBv2;
+using Amazon.DynamoDBv2.DocumentModel;
+using Amazon.DynamoDBv2.Model;
 
 namespace Akka.Persistence.DynamoDb.Snapshot
 {
     public class DynamoDbSnapshotStore : SnapshotStore, IWithUnboundedStash
     {
-        public static class Events
-        {
-            public sealed class Initialized
-            {
-                public static readonly Initialized Instance = new();
-                private Initialized() { }
-            }
-        }
-
         private readonly ActorSystem _actorSystem;
         private readonly AmazonDynamoDBClient _client;
         private readonly DynamoDbSnapshotStoreSettings _settings;
@@ -35,9 +28,9 @@ namespace Akka.Persistence.DynamoDb.Snapshot
         {
             _actorSystem = Context.System;
 
-            _settings = config is null ?
-                DynamoDbPersistence.Get(Context.System).SnapshotSettings :
-                DynamoDbSnapshotStoreSettings.Create(config);
+            _settings = config is null
+                ? DynamoDbPersistence.Get(Context.System).SnapshotSettings
+                : DynamoDbSnapshotStoreSettings.Create(config);
 
             _client = DynamoDbSetup.InitClient(_settings);
         }
@@ -48,7 +41,8 @@ namespace Akka.Persistence.DynamoDb.Snapshot
 
             if (!_settings.AutoInitialize)
             {
-                _table = Table.LoadTable(_client, _settings.TableName);
+                var builder = new TableBuilder(_client, new TableConfig(_settings.TableName));
+                _table = builder.Build();
 
                 return;
             }
@@ -59,13 +53,14 @@ namespace Akka.Persistence.DynamoDb.Snapshot
 
         public IStash? Stash { get; set; }
 
-        protected override async Task<SelectedSnapshot?> LoadAsync(
-            string persistenceId,
-            SnapshotSelectionCriteria criteria)
+        protected override async Task<SelectedSnapshot> LoadAsync(string persistenceId,
+            SnapshotSelectionCriteria criteria,
+            CancellationToken cancellationToken)
         {
             var filter = new QueryFilter();
             filter.AddCondition(SnapshotDocument.Keys.PersistenceId, QueryOperator.Equal, persistenceId);
-            filter.AddCondition(SnapshotDocument.Keys.SequenceNumber, QueryOperator.Between, criteria.MinSequenceNr, criteria.MaxSequenceNr);
+            filter.AddCondition(SnapshotDocument.Keys.SequenceNumber, QueryOperator.Between, criteria.MinSequenceNr,
+                criteria.MaxSequenceNr);
 
             var search = _table!.Query(new QueryOperationConfig
             {
@@ -77,41 +72,61 @@ namespace Akka.Persistence.DynamoDb.Snapshot
 
             while (!search.IsDone)
             {
-                var document = (await search.GetNextSetAsync())
-                    .Select(x => new SnapshotDocument(x))
-                    .FirstOrDefault(x => x.Timestamp >= (criteria.MinTimestamp ?? DateTime.MinValue).Ticks &&
-                                         x.Timestamp <= criteria.MaxTimeStamp.Ticks);
+                var items = await search.GetNextSetAsync(cancellationToken);
+                var document = items.FirstOrDefault(x =>
+                    x.TryGetLong(SnapshotDocument.Keys.Timestamp, out var longValue) &&
+                    longValue >= (criteria.MinTimestamp ?? DateTime.MinValue).Ticks &&
+                    longValue <= criteria.MaxTimeStamp.Ticks);
 
                 if (document != null)
-                    return document.ToSelectedSnapshot(_actorSystem);
+                {
+                    return new SnapshotDocument(document)
+                        .ToSelectedSnapshot(_actorSystem);
+                }
             }
 
             return null;
         }
 
-        protected override async Task SaveAsync(SnapshotMetadata metadata, object snapshot)
+        /// <inheritdoc />
+        protected override async Task SaveAsync(SnapshotMetadata metadata, object snapshot,
+            CancellationToken cancellationToken)
         {
-            await _table!.PutItemAsync(SnapshotDocument.ToDocument(metadata, snapshot, _actorSystem));
+            await _table!.PutItemAsync(SnapshotDocument.ToDocument(metadata, snapshot, _actorSystem),
+                cancellationToken);
         }
 
-        protected override async Task DeleteAsync(SnapshotMetadata metadata)
+        /// <inheritdoc />
+        protected override async Task DeleteAsync(SnapshotMetadata metadata, CancellationToken cancellationToken)
         {
-            var document = await _table!.GetItemAsync(metadata.PersistenceId, metadata.SequenceNr);
+            var document = await _table!.GetItemAsync(metadata.PersistenceId, metadata.SequenceNr, cancellationToken);
 
-            await _table.DeleteItemAsync(document);
+            if (document is null || !document.Any())
+            {
+                return;
+            }
+
+            var snapshotDocument = new SnapshotDocument(document);
+            if (metadata.Timestamp == DateTime.MinValue || snapshotDocument.Timestamp <= metadata.Timestamp.Ticks)
+            {
+                await _table.DeleteItemAsync(document, cancellationToken);
+            }
         }
 
-        protected override async Task DeleteAsync(string persistenceId, SnapshotSelectionCriteria criteria)
+        /// <inheritdoc />
+        protected override async Task DeleteAsync(string persistenceId, SnapshotSelectionCriteria criteria,
+            CancellationToken cancellationToken)
         {
             var filter = new QueryFilter();
             filter.AddCondition(SnapshotDocument.Keys.PersistenceId, QueryOperator.Equal, persistenceId);
-            filter.AddCondition(SnapshotDocument.Keys.SequenceNumber, QueryOperator.Between, criteria.MinSequenceNr, criteria.MaxSequenceNr);
+            filter.AddCondition(SnapshotDocument.Keys.SequenceNumber, QueryOperator.Between, criteria.MinSequenceNr,
+                criteria.MaxSequenceNr);
 
             var search = _table!.Query(persistenceId, filter);
 
             while (!search.IsDone)
             {
-                var items = await search.GetNextSetAsync();
+                var items = await search.GetNextSetAsync(cancellationToken);
 
                 var batch = _table.CreateBatchWrite();
 
@@ -119,14 +134,15 @@ namespace Akka.Persistence.DynamoDb.Snapshot
                 {
                     var snapshotDocument = new SnapshotDocument(item);
 
-                    if (snapshotDocument.Timestamp >= (criteria.MinTimestamp ?? DateTime.MinValue).Ticks &&
+                    if ((!criteria.MinTimestamp.HasValue || criteria.MinTimestamp.Value == DateTime.MinValue ||
+                         snapshotDocument.Timestamp >= criteria.MinTimestamp.Value.Ticks) &&
                         snapshotDocument.Timestamp <= criteria.MaxTimeStamp.Ticks)
                     {
                         batch.AddItemToDelete(item);
                     }
                 }
 
-                await batch.ExecuteAsync();
+                await batch.ExecuteAsync(cancellationToken);
             }
         }
 
@@ -148,7 +164,8 @@ namespace Akka.Persistence.DynamoDb.Snapshot
                     }.ToImmutableList(),
                     ImmutableList<GlobalSecondaryIndex>.Empty);
 
-                _table = Table.LoadTable(_client, _settings.TableName);
+                var builder = new TableBuilder(_client, new TableConfig(_settings.TableName));
+                _table = builder.Build();
 
                 return Events.Initialized.Instance;
             }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Threading;
@@ -13,55 +14,9 @@ namespace Akka.Persistence.DynamoDb.Test
     {
         public static IDisposable StartDynamoDbLocalstackContainer(int mainPort, int servicesPort)
         {
-            bool WaitForStart(TimeSpan timeout)
-            {
-                Console.WriteLine($"Waiting for localstack to start. (main port: {mainPort}, services port: {servicesPort})");
-
-                var timer = Stopwatch.StartNew();
-                var httpClient = new HttpClient();
-
-                while (timer.Elapsed < timeout)
-                {
-                    try
-                    {
-                        var response = httpClient.GetAsync($"http://127.0.0.1:{mainPort}/health").Result;
-
-                        if (response.IsSuccessStatusCode)
-                        {
-                            var responseData = response.Content.ReadFromJsonAsync<HealthResponse>().Result ??
-                                               new HealthResponse
-                                               {
-                                                   Services = ImmutableDictionary<string, string>.Empty
-                                               };
-                            
-                            Console.WriteLine($"Polled localstack with result: {response.Content.ReadAsStringAsync().Result}");
-
-                            if (responseData.Services.Any()
-                                && responseData.Services.ContainsKey("dynamodb") &&
-                                responseData.Services["dynamodb"] == "running")
-                            {
-                                Console.WriteLine($"Running services: {string.Join(", ", responseData.Services.Keys)}");
-
-                                return true;
-                            }
-                        }
-
-                        Thread.Sleep(TimeSpan.FromSeconds(5));
-                    }
-                    catch (Exception exception)
-                    {
-                        Console.WriteLine($"Failed polling localstack: {exception.Message}");
-                        
-                        Thread.Sleep(TimeSpan.FromSeconds(5));
-                    }
-                }
-
-                return false;
-            }
-
             var containerName = Guid.NewGuid().ToString();
 
-            var runningContainer = ContainerFromImage("localstack/localstack:latest", containerName)
+            var runningContainer = ContainerFromImage("localstack/localstack:2.3.2", containerName)
                 .Detached()
                 .WithDockerSocket()
                 .Port(mainPort, 8080)
@@ -70,12 +25,60 @@ namespace Akka.Persistence.DynamoDb.Test
                 .EnvironmentVariable("DEBUG", "1")
                 .Run();
 
-            if (WaitForStart(TimeSpan.FromMinutes(2)))
+            if (WaitForStart(TimeSpan.FromMinutes(2), mainPort, servicesPort))
+            {
                 return runningContainer;
+            }
 
             runningContainer.Dispose();
 
             throw new Exception("Couldn't start localstack in time");
+        }
+
+        private static bool WaitForStart(TimeSpan timeout, int mainPort, int servicesPort)
+        {
+            Console.WriteLine($"Waiting for localstack to start. (main port: {mainPort}, services port: {servicesPort})");
+
+            var timer = Stopwatch.StartNew();
+
+            while (timer.Elapsed < timeout)
+            {
+                try
+                {
+                    var httpClient = new HttpClient { BaseAddress = new Uri($"http://{IPAddress.Loopback}:{servicesPort}") };
+                    var response = httpClient.GetAsync("health").Result;
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var responseData = response.Content.ReadFromJsonAsync<HealthResponse>().Result ?? new HealthResponse
+                        {
+                            Services = ImmutableDictionary<string, string>.Empty
+                        };
+
+                        var result = response.Content.ReadAsStringAsync().Result;
+                        Console.WriteLine($"Polled localstack with result: {result}");
+
+                        if (responseData.Services.Any()
+                            && responseData.Services.ContainsKey("dynamodb") &&
+                            responseData.Services["dynamodb"] == "available")
+                        {
+                            Console.WriteLine($"Running services: {string.Join(", ", responseData.Services.Keys)}");
+
+                            return true;
+                        }
+                    }
+
+                    Thread.Sleep(TimeSpan.FromSeconds(5));
+                }
+                catch (Exception exception)
+                {
+                    Console.WriteLine($"Failed polling localstack: {exception.Message}");
+
+                    Thread.Sleep(TimeSpan.FromSeconds(5));
+                }
+            }
+
+            return false;
         }
 
         private static Container ContainerFromImage(string image, string name)
